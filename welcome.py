@@ -490,8 +490,6 @@ async def handle_custom_triggers(ws, group_id, user_id, message, event=None):
                 await asyncio.sleep(delay_after_forward)
             except Exception:
                 pass
-
-            # 只 @ 被提到的其他人：句首 → 句末，去重
             order_qqs: List[str] = []
             seen = set()
             for q in at_leading + at_trailing:
@@ -499,14 +497,12 @@ async def handle_custom_triggers(ws, group_id, user_id, message, event=None):
                 if q and q not in seen:
                     seen.add(q)
                     order_qqs.append(q)
-
             segs = []
             if fwd_id:
                 segs.append({"type": "reply", "data": {"id": fwd_id}})
+            segs.append({"type": "text", "data": {"text": "请阅读该聊天记录内的内容"}})
             for q in order_qqs:
                 segs.append({"type": "at", "data": {"qq": q}})
-            segs.append({"type": "text", "data": {"text": " 请阅读该聊天记录内的内容"}})
-
             await send_group_msg_segments(ws, group_id, segs)
             logging.info(f"📣 已 reply+@ | 群 {group_id} | at={order_qqs} | reply_to={fwd_id}")
         return
