@@ -1,5 +1,5 @@
 📣 如果上面的内容仍未解决你的问题，且是部署相关问题，请先阅读《提问指南》的规则后，按照规则提问：
-[CQ:image,file=http://localhost:61894/how_to_ask.png]
+[CQ:image,file=http://localhost:23156/how_to_ask.png]
 🌐 网页版链接：https://blog.cn.xuetao.host/how_to_ask.html
 
 💡 “2025年的提问，比十年前的论坛时代容易多了，但提问时最起码的态度——‘写清楚、写完整、不让答者追问’——不应该倒退十年。
