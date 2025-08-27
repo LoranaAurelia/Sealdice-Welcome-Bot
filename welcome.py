@@ -86,7 +86,7 @@ async def ws_reader(ws):
         # 事件
         await EVENT_QUEUE.put(data)
         
-# ==================== OneBot11 发送（保持你现有规范） ====================
+# ==================== OneBot11 发送 ====================
 async def send_group_msg(ws, group_id, message):
     resp = await send_action(ws, "send_group_msg", {
         "group_id": int(group_id),
@@ -258,7 +258,7 @@ class Store:
 
 STORE = Store()
 
-# ==================== 迎新流程（保持你原有节奏 + 详细日志） ====================
+# ==================== 迎新流程 ====================
 新人记录: Dict[str, List[str]] = {}
 定时器任务: Dict[str, asyncio.Task] = {}
 触发冷却记录: Dict[Tuple[str, str], float] = {}
@@ -329,212 +329,225 @@ async def schedule_welcome(ws, group_id):
     定时器任务.pop(group_id, None)
     logging.info(f"🧹 清理欢迎状态完成 | 群 {group_id}")
 
-# ==================== 触发逻辑（兼容你现有规则 + 详细日志） ====================
-def build_sep_pattern():
-    return r"(?:,|，|~|～|\?|？|!|！|…{1,2}|\.{3,6})"
+# ==================== 触发逻辑 ====================
+# ==================== 触发逻辑（放松匹配：同句中出现“称呼/@bot + 关键词”才触发） ====================
+URL_PATTERN = re.compile(r'https?://\S+|\b[\w-]+(?:\.[\w-]+)+\S*', re.IGNORECASE)
 
-def normalize_for_match(s: str) -> str:
-    return re.sub(r"[^\w\u4e00-\u9fff]+", "", s)
+def strip_urls(text: str) -> str:
+    """移除 http(s) 链接与裸域名，避免 'mac' 被 'xxx.com' 误触。"""
+    return URL_PATTERN.sub(' ', text or '')
 
-def extract_at_info_and_text(event: dict, self_id: Optional[str]) -> Tuple[bool, List[str], List[str], str]:
-    """
-    解析 OneBot11 标准消息段：
-    返回 (has_at_me, leading_others, trailing_others, text_all)
-    - has_at_me：是否 @ 了机器人（任意位置）
-    - leading_others：句首连续出现的 @别人的 qq 列表（不含机器人）
-    - trailing_others：句末连续出现的 @别人的 qq 列表（不含机器人）
-    - text_all：把所有 text 段拼起来（仅文本）
-    """
-    msg = event.get("message")
-    if not isinstance(msg, list):
-        return False, [], [], ""
+def is_ascii_token(s: str) -> bool:
+    return bool(re.fullmatch(r'[A-Za-z0-9_-]+', s or ''))
 
-    def _is_blank_text(seg):
-        return seg.get("type") == "text" and seg.get("data", {}).get("text", "").strip() == ""
-
-    has_at_me = any(seg.get("type") == "at" and str(seg.get("data", {}).get("qq")) == str(self_id) for seg in msg)
-
-    # 句首连续 @别人
-    leading = []
-    i = 0
-    while i < len(msg):
-        seg = msg[i]
-        if _is_blank_text(seg):
-            i += 1
-            continue
-        if seg.get("type") == "at":
-            qq = str(seg.get("data", {}).get("qq"))
-            if qq != str(self_id):
-                leading.append(qq)
-                i += 1
-                continue
-        break
-
-    # 句末连续 @别人
-    trailing = []
-    j = len(msg) - 1
-    while j >= 0:
-        seg = msg[j]
-        if _is_blank_text(seg):
-            j -= 1
-            continue
-        if seg.get("type") == "at":
-            qq = str(seg.get("data", {}).get("qq"))
-            if qq != str(self_id):
-                trailing.append(qq)
-                j -= 1
-                continue
-        break
-    trailing.reverse()
-
-    # 汇总文本
-    texts = []
-    for seg in msg:
-        if seg.get("type") == "text":
-            texts.append(seg.get("data", {}).get("text", ""))
-    text_all = "".join(texts).strip()
-    return has_at_me, leading, trailing, text_all
+def ascii_word_boundary_hit(haystack: str, needle: str) -> bool:
+    """对全 ASCII 触发词，用词边界匹配，避免 'weizaima.com' 命中 'mac'。"""
+    if not is_ascii_token(needle):
+        return False
+    return re.search(rf'\b{re.escape(needle)}\b', haystack, re.IGNORECASE) is not None
 
 def has_reply_segment(event: dict) -> bool:
-    """是否包含 OneBot11 标准 reply 段"""
+    """是否包含 OneBot11 标准 reply 段（仅用于日志，不作为触发入口）"""
     msg = event.get("message")
     if not isinstance(msg, list):
         return False
     return any(seg.get("type") == "reply" for seg in msg)
 
+def collect_other_ats(event: dict, self_id: Optional[str]) -> List[str]:
+    """
+    收集整条消息中 @到的“其他用户”（排除 @all 与 @bot 自己），按出现顺序去重。
+    """
+    msg = event.get("message")
+    if not isinstance(msg, list):
+        return []
+    seen = set()
+    order = []
+    for seg in msg:
+        if seg.get("type") != "at":
+            continue
+        qq = str(seg.get("data", {}).get("qq", "")).strip()
+        if not qq or qq.lower() == "all":
+            continue
+        if self_id is not None and qq == str(self_id):
+            continue
+        if qq not in seen:
+            seen.add(qq)
+            order.append(qq)
+    return order
+
+def extract_at_info_and_text(event: dict, self_id: Optional[str]) -> Tuple[bool, str]:
+    """
+    从 OneBot11 消息段中提取：
+    - has_at_me：是否 @ 了机器人（任意位置）
+    - text_all：把所有 text 段拼起来（保持顺序，去除首尾空白）
+    """
+    msg = event.get("message")
+    if not isinstance(msg, list):
+        return False, ""
+
+    has_at_me = any(
+        seg.get("type") == "at" and str(seg.get("data", {}).get("qq")) == str(self_id)
+        for seg in msg
+    )
+    texts: List[str] = []
+    for seg in msg:
+        if seg.get("type") == "text":
+            texts.append(str(seg.get("data", {}).get("text", "")))
+    text_all = "".join(texts).strip()
+    return has_at_me, text_all
+
+def normalize_for_match(s: str) -> str:
+    """
+    归一化用于“非 ASCII（含中文）”关键词匹配：
+    - 全部转小写
+    - 去掉除 [A-Za-z0-9_] 与 CJK 基本区外的所有字符
+    """
+    s = (s or "").lower()
+    return re.sub(r"[^\w\u4e00-\u9fff]+", "", s)
+
 async def handle_custom_triggers(ws, group_id, user_id, message, event=None):
-    raw_msg = message
-    message = message.strip()
+    """
+    触发条件（放松版）：
+      - 同一条消息内，只要出现【机器人称呼中的任一名字】或【@到机器人】，
+      - 且同时出现【任一预制关键词（触发词）】，即触发。
+    回复形态允许，但不作为单独入口。
+    关键词匹配规则：
+      - 纯 ASCII 触发词用 \b 词边界匹配（先移除 URL/域名）；
+      - 其它（如中文）按归一化字符串的子串匹配。
+    """
+    raw_msg = (message or "").strip()
     now = time.time()
 
-    sep_pattern = build_sep_pattern()
+    # —— 解析消息结构
+    has_at_me, text_only = (False, "")
+    if isinstance(event, dict):
+        has_at_me, text_only = extract_at_info_and_text(event, STORE.self_id)
+    has_reply = bool(event) and has_reply_segment(event)  # 仅日志使用
 
-    # —— 解析 OneBot11 消息段：是否 @了机器人、句首/句末 @别人、纯文本
-    has_at_me, at_leading, at_trailing, text_only = (False, [], [], "")
-    if isinstance(event, dict) and STORE.settings.get("mention_trigger_enabled", True):
-        has_at_me, at_leading, at_trailing, text_only = extract_at_info_and_text(event, STORE.self_id)
+    # 优先使用 text_only（规避 CQ 码），否则退回 raw
+    src_text = (text_only or raw_msg).strip()
 
-    # 新增：检测是否含 reply 段
-    has_reply = bool(event) and has_reply_segment(event)
+    # 入口一：是否提到名字（在整句任意位置）
+    text_no_urls = strip_urls(src_text)
+    names = STORE.settings.get("names", []) or []
+    name_mentioned = False
+    for nm in names:
+        if not nm:
+            continue
+        if is_ascii_token(nm):
+            if ascii_word_boundary_hit(text_no_urls, nm):
+                name_mentioned = True
+                break
+        else:
+            # 非 ASCII（如中文）宽松子串
+            if nm.lower() in text_no_urls.lower():
+                name_mentioned = True
+                break
 
-    # 统一一个文本源：优先用 text_only，其次退回 raw 文本
-    src_text = (text_only or message or "").strip()
+    # —— 入口判定：必须满足（@bot 或 提到名字）之一
+    if not (has_at_me or name_mentioned):
+        logging.debug(f"🔎 入口未满足：无@bot且未提到称呼 | 群 {group_id} | 用户 {user_id} | msg={raw_msg!r}")
+        return
 
-    # —— 确定入口与“待匹配文本”
-    used_at_entry = False
-    used_reply_entry = False
-    if has_at_me:
-        # A) @机器人触发：不要求称呼
-        content = src_text
-        used_at_entry = True
-        left = f"@{STORE.self_id}"
-    elif has_reply:
-        # B) **回复触发**：不要求称呼（允许直接“[回复]洛拉娜，签名”甚至“[回复]签名”）
-        content = src_text
-        used_reply_entry = True
-        left = "[reply]"
-    else:
-        # C) 称呼 + 分隔符 + 内容
-        trimmed = re.sub(r"[,，~～\?？!！…\.]+$", "", src_text)
-        sep_match = re.search(sep_pattern, trimmed)
-        if not sep_match:
-            logging.debug(f"🔎 触发检查未命中：无@bot、无reply且无分隔符 | 群 {group_id} | 用户 {user_id} | msg={raw_msg!r} | src_text={src_text!r}")
-            return
-        sep_start, sep_end = sep_match.span()
-        left = trimmed[:sep_start]
-        right = trimmed[sep_end:]
-
-        # 左侧必须包含称呼：名字（这里不要求 @机器人）
-        names = STORE.settings.get("names", [])
-        if names:
-            name_pattern = "|".join(re.escape(n) for n in names)
-            if not re.search(rf"(?i){name_pattern}", left):
-                logging.debug(f"🔎 左侧未包含称呼 | 群 {group_id} | 用户 {user_id} | left={left!r}")
-                return
-        content = right
-
-    # —— 清洗用于匹配 & 日志
-    content = re.sub(rf"^{sep_pattern}+", "", content or "").strip()
-    content_clean = normalize_for_match(content)
-    logging.info(
-        f"💬 触发候选 | 群 {group_id} | 用户 {user_id} | "
-        f"used_at={used_at_entry} | used_reply={used_reply_entry} | "
-        f"content={content!r} | clean={content_clean!r}"
-    )
-    
-    # —— 冷却
+    # —— 冷却（普通用户）
     key = (group_id, user_id)
     if user_id != STORE.settings.get("super_user_id", ""):
         last = 触发冷却记录.get(key, 0.0)
         cd = STORE.settings.get("trigger_cooldown_seconds", 1)
         if now - last < cd:
-            logging.info(f"⏳ 冷却拦截 | 群 {group_id} | 用户 {user_id} | cool_down={cd}s | since={now - last:.2f}s")
+            logging.info(f"⏳ 冷却拦截 | 群 {group_id} | 用户 {user_id} | cd={cd}s | since={now - last:.2f}s")
             return
         触发冷却记录[key] = now
 
+    # —— 关键词清洗：移除 URL → 两路文本
+    # 路1：text_no_urls（用于 ASCII 词边界匹配）
+    # 路2：content_clean（用于非 ASCII 宽松匹配）
+    content_no_urls = text_no_urls
+    content_clean = normalize_for_match(content_no_urls)
+
     # —— 匹配（最长关键字优先）
+    def kw_hit(kw: str) -> bool:
+        if not kw:
+            return False
+        if is_ascii_token(kw):
+            return ascii_word_boundary_hit(content_no_urls, kw)
+        # 中文/混合：用清洗后的子串匹配
+        return kw.lower() in content_clean.lower()
+
     best_single = None
-    best_len = 0
+    best_len_s = 0
     best_kw_single = None
+
     for trg_list, order_key, body, p in STORE.trig_singles:
         for kw in sorted(trg_list, key=len, reverse=True):
-            if kw and kw.lower() in content_clean.lower() and len(kw) > best_len:
+            if kw_hit(kw) and len(kw) > best_len_s:
                 best_single = (trg_list, order_key, body, p)
-                best_len = len(kw)
+                best_len_s = len(kw)
                 best_kw_single = kw
                 break
 
     best_group = None
     best_len_g = 0
     best_kw_group = None
+
     for trg_list, dir_key, parts, d in STORE.trig_groups:
         for kw in sorted(trg_list, key=len, reverse=True):
-            if kw and kw.lower() in content_clean.lower() and len(kw) > best_len_g:
+            if kw_hit(kw) and len(kw) > best_len_g:
                 best_group = (trg_list, dir_key, parts, d)
                 best_len_g = len(kw)
                 best_kw_group = kw
                 break
 
+    logging.info(
+        f"💬 触发候选 | 群 {group_id} | 用户 {user_id} | "
+        f"has_at_me={has_at_me} | name_mentioned={name_mentioned} | has_reply={has_reply} | "
+        f"best_single_kw={best_kw_single!r} | best_group_kw={best_kw_group!r}"
+    )
+
+    # —— 若完全未命中任何关键词 → 不触发
+    if not best_single and not best_group:
+        logging.debug(f"🙈 未命中任何触发词 | 群 {group_id} | 用户 {user_id}")
+        return
+
     # —— 组合触发优先（若关键字不短于单条）
-    if best_group and best_len_g >= best_len:
+    if best_group and best_len_g >= best_len_s:
         texts = [b for _, b, _ in sorted(best_group[2], key=lambda x: x[0]) if b]
         files = [p.name for _, _, p in sorted(best_group[2], key=lambda x: x[0])]
-        logging.info(f"✅ 组合触发 | 群 {group_id} | 用户 {user_id} | 关键字={best_kw_group!r} | 目录={best_group[3].name} | 片段={files}")
+        logging.info(f"✅ 组合触发 | 群 {group_id} | 用户 {user_id} | 关键字={best_kw_group!r} | 片段={files}")
 
         if texts:
-            fwd_id = await send_forward_message(ws, group_id, texts, STORE.self_id or STORE.settings.get("forward_sender_id", "2162317375"))
+            fwd_id = await send_forward_message(
+                ws, group_id, texts,
+                STORE.self_id or STORE.settings.get("forward_sender_id", "2162317375")
+            )
             logging.info(f"📨 合并转发已发送 | 群 {group_id} | fwd_id={fwd_id}")
+
+            # 收集本条消息中 @到的其他用户（全量）
+            order_qqs = collect_other_ats(event or {}, STORE.self_id)
 
             delay_after_forward = float(STORE.settings.get("group_forward_then_at_delay_seconds", 1.0))
             try:
                 await asyncio.sleep(delay_after_forward)
             except Exception:
                 pass
-            order_qqs: List[str] = []
-            seen = set()
-            for q in at_leading + at_trailing:
-                q = str(q)
-                if q and q not in seen:
-                    seen.add(q)
-                    order_qqs.append(q)
+
             segs = []
             if fwd_id:
                 segs.append({"type": "reply", "data": {"id": fwd_id}})
             segs.append({"type": "text", "data": {"text": "请阅读该聊天记录内的内容"}})
             for q in order_qqs:
                 segs.append({"type": "at", "data": {"qq": q}})
+
             await send_group_msg_segments(ws, group_id, segs)
             logging.info(f"📣 已 reply+@ | 群 {group_id} | at={order_qqs} | reply_to={fwd_id}")
         return
-    
+
     # —— 单条触发
     if best_single:
         logging.info(f"✅ 单条触发 | 群 {group_id} | 用户 {user_id} | 关键字={best_kw_single!r} | 文件={best_single[3].name}")
         await send_group_msg(ws, group_id, best_single[2])
         logging.info(f"📨 单条消息已发送 | 群 {group_id}")
         return
-
-    logging.debug(f"🙈 未命中任何触发 | 群 {group_id} | 用户 {user_id} | clean={content_clean!r}")
 
 # ==================== 主循环 ====================
 async def reloader_loop():
