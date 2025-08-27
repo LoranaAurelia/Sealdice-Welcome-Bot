@@ -395,6 +395,13 @@ def extract_at_info_and_text(event: dict, self_id: Optional[str]) -> Tuple[bool,
     text_all = "".join(texts).strip()
     return has_at_me, leading, trailing, text_all
 
+def has_reply_segment(event: dict) -> bool:
+    """是否包含 OneBot11 标准 reply 段"""
+    msg = event.get("message")
+    if not isinstance(msg, list):
+        return False
+    return any(seg.get("type") == "reply" for seg in msg)
+
 async def handle_custom_triggers(ws, group_id, user_id, message, event=None):
     raw_msg = message
     message = message.strip()
@@ -407,22 +414,31 @@ async def handle_custom_triggers(ws, group_id, user_id, message, event=None):
     if isinstance(event, dict) and STORE.settings.get("mention_trigger_enabled", True):
         has_at_me, at_leading, at_trailing, text_only = extract_at_info_and_text(event, STORE.self_id)
 
+    # 新增：检测是否含 reply 段
+    has_reply = bool(event) and has_reply_segment(event)
+
     # 统一一个文本源：优先用 text_only，其次退回 raw 文本
     src_text = (text_only or message or "").strip()
 
     # —— 确定入口与“待匹配文本”
     used_at_entry = False
+    used_reply_entry = False
     if has_at_me:
-        # A) @机器人触发：不要求称呼；匹配用 src_text（text_only）
+        # A) @机器人触发：不要求称呼
         content = src_text
         used_at_entry = True
         left = f"@{STORE.self_id}"
+    elif has_reply:
+        # B) **回复触发**：不要求称呼（允许直接“[回复]洛拉娜，签名”甚至“[回复]签名”）
+        content = src_text
+        used_reply_entry = True
+        left = "[reply]"
     else:
-        # B) 称呼 + 分隔符 + 内容：也用 src_text（避免 CQ 码干扰）
+        # C) 称呼 + 分隔符 + 内容
         trimmed = re.sub(r"[,，~～\?？!！…\.]+$", "", src_text)
         sep_match = re.search(sep_pattern, trimmed)
         if not sep_match:
-            logging.debug(f"🔎 触发检查未命中：无@bot且无分隔符 | 群 {group_id} | 用户 {user_id} | msg={raw_msg!r} | src_text={src_text!r}")
+            logging.debug(f"🔎 触发检查未命中：无@bot、无reply且无分隔符 | 群 {group_id} | 用户 {user_id} | msg={raw_msg!r} | src_text={src_text!r}")
             return
         sep_start, sep_end = sep_match.span()
         left = trimmed[:sep_start]
@@ -437,11 +453,15 @@ async def handle_custom_triggers(ws, group_id, user_id, message, event=None):
                 return
         content = right
 
-    # —— 清洗用于匹配
+    # —— 清洗用于匹配 & 日志
     content = re.sub(rf"^{sep_pattern}+", "", content or "").strip()
     content_clean = normalize_for_match(content)
-    logging.info(f"💬 触发候选 | 群 {group_id} | 用户 {user_id} | used_at={used_at_entry} | content={content!r} | clean={content_clean!r}")
-
+    logging.info(
+        f"💬 触发候选 | 群 {group_id} | 用户 {user_id} | "
+        f"used_at={used_at_entry} | used_reply={used_reply_entry} | "
+        f"content={content!r} | clean={content_clean!r}"
+    )
+    
     # —— 冷却
     key = (group_id, user_id)
     if user_id != STORE.settings.get("super_user_id", ""):
