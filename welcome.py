@@ -330,22 +330,6 @@ async def schedule_welcome(ws, group_id):
     logging.info(f"🧹 清理欢迎状态完成 | 群 {group_id}")
 
 # ==================== 触发逻辑 ====================
-# ==================== 触发逻辑（放松匹配：同句中出现“称呼/@bot + 关键词”才触发） ====================
-URL_PATTERN = re.compile(r'https?://\S+|\b[\w-]+(?:\.[\w-]+)+\S*', re.IGNORECASE)
-
-def strip_urls(text: str) -> str:
-    """移除 http(s) 链接与裸域名，避免 'mac' 被 'xxx.com' 误触。"""
-    return URL_PATTERN.sub(' ', text or '')
-
-def is_ascii_token(s: str) -> bool:
-    return bool(re.fullmatch(r'[A-Za-z0-9_-]+', s or ''))
-
-def ascii_word_boundary_hit(haystack: str, needle: str) -> bool:
-    """对全 ASCII 触发词，用词边界匹配，避免 'weizaima.com' 命中 'mac'。"""
-    if not is_ascii_token(needle):
-        return False
-    return re.search(rf'\b{re.escape(needle)}\b', haystack, re.IGNORECASE) is not None
-
 def has_reply_segment(event: dict) -> bool:
     """是否包含 OneBot11 标准 reply 段（仅用于日志，不作为触发入口）"""
     msg = event.get("message")
@@ -396,14 +380,15 @@ def extract_at_info_and_text(event: dict, self_id: Optional[str]) -> Tuple[bool,
     text_all = "".join(texts).strip()
     return has_at_me, text_all
 
-def normalize_for_match(s: str) -> str:
-    """
-    归一化用于“非 ASCII（含中文）”关键词匹配：
-    - 全部转小写
-    - 去掉除 [A-Za-z0-9_] 与 CJK 基本区外的所有字符
-    """
-    s = (s or "").lower()
-    return re.sub(r"[^\w\u4e00-\u9fff]+", "", s)
+def contains_any_name(text: str, names: List[str]) -> bool:
+    """是否包含称呼中的任意名字（不区分大小写，直接子串匹配）"""
+    if not text or not names:
+        return False
+    low = text.lower()
+    for nm in names:
+        if nm and nm.lower() in low:
+            return True
+    return False
 
 async def handle_custom_triggers(ws, group_id, user_id, message, event=None):
     """
@@ -411,9 +396,7 @@ async def handle_custom_triggers(ws, group_id, user_id, message, event=None):
       - 同一条消息内，只要出现【机器人称呼中的任一名字】或【@到机器人】，
       - 且同时出现【任一预制关键词（触发词）】，即触发。
     回复形态允许，但不作为单独入口。
-    关键词匹配规则：
-      - 纯 ASCII 触发词用 \b 词边界匹配（先移除 URL/域名）；
-      - 其它（如中文）按归一化字符串的子串匹配。
+    关键词匹配：不区分大小写的“精确子串”匹配（不再剔除 URL/域名；'1.4.6' 能匹配）。
     """
     raw_msg = (message or "").strip()
     now = time.time()
@@ -422,29 +405,15 @@ async def handle_custom_triggers(ws, group_id, user_id, message, event=None):
     has_at_me, text_only = (False, "")
     if isinstance(event, dict):
         has_at_me, text_only = extract_at_info_and_text(event, STORE.self_id)
-    has_reply = bool(event) and has_reply_segment(event)  # 仅日志使用
+    has_reply = bool(event) and has_reply_segment(event)  # 仅日志
 
     # 优先使用 text_only（规避 CQ 码），否则退回 raw
     src_text = (text_only or raw_msg).strip()
-
-    # 入口一：是否提到名字（在整句任意位置）
-    text_no_urls = strip_urls(src_text)
-    names = STORE.settings.get("names", []) or []
-    name_mentioned = False
-    for nm in names:
-        if not nm:
-            continue
-        if is_ascii_token(nm):
-            if ascii_word_boundary_hit(text_no_urls, nm):
-                name_mentioned = True
-                break
-        else:
-            # 非 ASCII（如中文）宽松子串
-            if nm.lower() in text_no_urls.lower():
-                name_mentioned = True
-                break
+    src_lower = src_text.lower()
 
     # —— 入口判定：必须满足（@bot 或 提到名字）之一
+    names = STORE.settings.get("names", []) or []
+    name_mentioned = contains_any_name(src_text, names)
     if not (has_at_me or name_mentioned):
         logging.debug(f"🔎 入口未满足：无@bot且未提到称呼 | 群 {group_id} | 用户 {user_id} | msg={raw_msg!r}")
         return
@@ -459,20 +428,9 @@ async def handle_custom_triggers(ws, group_id, user_id, message, event=None):
             return
         触发冷却记录[key] = now
 
-    # —— 关键词清洗：移除 URL → 两路文本
-    # 路1：text_no_urls（用于 ASCII 词边界匹配）
-    # 路2：content_clean（用于非 ASCII 宽松匹配）
-    content_no_urls = text_no_urls
-    content_clean = normalize_for_match(content_no_urls)
-
-    # —— 匹配（最长关键字优先）
+    # —— 关键词匹配：不区分大小写的子串（支持 '1.4.6' 这类含点关键词）
     def kw_hit(kw: str) -> bool:
-        if not kw:
-            return False
-        if is_ascii_token(kw):
-            return ascii_word_boundary_hit(content_no_urls, kw)
-        # 中文/混合：用清洗后的子串匹配
-        return kw.lower() in content_clean.lower()
+        return bool(kw) and kw.lower() in src_lower
 
     best_single = None
     best_len_s = 0
@@ -566,7 +524,15 @@ async def main():
     welcome_enabled = STORE.settings.get("welcome_enabled", True)
     welcome_groups = set(str(x) for x in STORE.settings.get("welcome_groups", []))
     log_group = STORE.settings.get("log_group", "")
+    trigger_enabled = STORE.settings.get("trigger_enabled", True)
 
+    if "trigger_groups" in STORE.settings:
+        trigger_groups = set(str(x) for x in STORE.settings.get("trigger_groups", []))
+    else:
+        # 未配置 trigger_groups 时，默认沿用 welcome_groups（保持兼容）
+        trigger_groups = set(welcome_groups)
+
+    logging.info(f"🎯 触发启用：{trigger_enabled} | 触发群：{sorted(list(trigger_groups))}")
     logging.info(f"🔌 WebSocket 地址：{uri}")
     logging.info(f"👮‍♀️ 欢迎启用：{welcome_enabled} | 欢迎群：{sorted(list(welcome_groups))}")
 
@@ -622,8 +588,10 @@ async def main():
                                         logging.info(f"⏹️ 测试迎新：清理旧定时器 | 群 {group_id}")
                                     await schedule_welcome(ws, group_id)
                                 else:
-                                    if group_id in welcome_groups:
+                                    if trigger_enabled and group_id in trigger_groups:
                                         await handle_custom_triggers(ws, group_id, user_id, raw, event)
+                                    else:
+                                        logging.debug(f"⛔ 触发未启用或不在白名单群 | 群 {group_id}")
 
                         except Exception as e:
                             logging.warning(f"事件处理异常：{e}")
