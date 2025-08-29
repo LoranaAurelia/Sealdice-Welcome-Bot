@@ -1,1 +1,0 @@
-[CQ:image,file=http://localhost:23156/gocq-sb.png]

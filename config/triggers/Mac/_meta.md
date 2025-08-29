@@ -1,3 +1,0 @@
-+++
-triggers = ["Mac", "mac", "MAC"]
-+++
