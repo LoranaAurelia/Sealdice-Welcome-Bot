@@ -1,0 +1,3 @@
++++
+triggers = ["Mac", "mac", "MAC"]
++++
