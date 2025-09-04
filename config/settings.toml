@@ -5,16 +5,22 @@ ws_url = "ws://127.0.0.1:30001"
 welcome_enabled = true
 welcome_groups = ["524364253", "562897832", "715664650", "917654757", "747114944", "583980948"]
 
-# 回复词开关 & 群列表
+# 回复词开关 & 强制开启群列表
 trigger_enabled = true
 trigger_groups  = ["524364253", "562897832", "715664650", "917654757", "747114944", "583980948", "1012508116"]
+
+# 新增：允许私聊触发
+trigger_enable_private = true
+
+# 新增：非白名单群是否允许被开启
+trigger_allow_nonlisted_groups = true
 
 # 日志群
 log_group = "583980948"
 
 # 迎新延迟与发送间隔（秒）
 welcome_delay_seconds = 120
-welcome_gap_seconds = 3
+welcome_gap_seconds = 2
 
 # 识别的称呼 & 触发冷却
 names = ["雪桃", "洛拉娜", "洛拉娜·奥蕾莉娅", "Lorana", "Lorana Aurelia"]
@@ -28,7 +34,10 @@ test_command = "Another Me，测试迎新"
 forward_sender_id = "2162317375"
 
 # 合并转发发出后再 @ 的延迟（秒）
-group_forward_then_at_delay_seconds = 3.0
+group_forward_then_at_delay_seconds = 0.1
+
+# 私聊合并转发发出后再发送提示的延迟（秒）
+private_forward_then_hint_delay_seconds = 0.1
 
 # 允许 @ 机器人触发
 mention_trigger_enabled = true
