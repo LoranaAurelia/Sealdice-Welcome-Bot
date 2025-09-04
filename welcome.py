@@ -641,11 +641,11 @@ async def maybe_handle_trigger_switch(ws, event: dict) -> bool:
     rx = _build_switch_regex()
     if not rx:
         return False
-    m = rx.search(text)
+    m = rx.fullmatch(text)
     if not m:
         return False
 
-    action = m.group(2)  # '开' or '关'
+    action = m.group(1)
     super_id = str(STORE.settings.get("super_user_id", ""))
 
     # ===== 私聊：直接改 dm_blocked =====
@@ -654,12 +654,12 @@ async def maybe_handle_trigger_switch(ws, event: dict) -> bool:
             if user_id not in TRIG_STATE["dm_blocked"]:
                 TRIG_STATE["dm_blocked"].append(user_id)
                 _state_save()
-            await send_private_msg(ws, user_id, "已为这条私聊关闭触发（回复“名字回应开”可重新开启）。")
+            await send_private_msg(ws, user_id, "已为该私聊关闭触发（回复“名字回应开”可重新开启）。")
         else:  # 开
             if user_id in TRIG_STATE["dm_blocked"]:
                 TRIG_STATE["dm_blocked"].remove(user_id)
                 _state_save()
-            await send_private_msg(ws, user_id, "已为这条私聊开启触发。")
+            await send_private_msg(ws, user_id, "已为该私聊开启触发。")
         return True
 
     # ===== 群聊：需权限 & 规则判断 =====
