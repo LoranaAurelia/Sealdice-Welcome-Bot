@@ -5,7 +5,7 @@ import time
 import logging
 import re
 from pathlib import Path
-from typing import Any, Dict, List, Tuple, Optional
+from typing import Any, Dict, List, Tuple, Optional, Set
 import tomllib
 import uuid
 from asyncio import Queue
@@ -86,7 +86,7 @@ async def ws_reader(ws):
         # 事件
         await EVENT_QUEUE.put(data)
         
-# ==================== OneBot11 发送 ====================
+# ==================== OneBot11 发送（群聊）====================
 async def send_group_msg(ws, group_id, message):
     resp = await send_action(ws, "send_group_msg", {
         "group_id": int(group_id),
@@ -112,6 +112,38 @@ async def send_forward_message(ws, group_id, messages, sender_id, sender_name="�
         })
     resp = await send_action(ws, "send_group_forward_msg", {
         "group_id": int(group_id),
+        "messages": nodes
+    })
+    data = resp.get("data") or {}
+    return data.get("message_id") or data.get("id")
+
+# ==================== OneBot11 发送（私聊）====================
+async def send_private_msg(ws, user_id, message):
+    resp = await send_action(ws, "send_private_msg", {
+        "user_id": int(user_id),
+        "message": message
+    })
+    data = resp.get("data") or {}
+    return data.get("message_id") or data.get("id")
+
+async def send_private_msg_segments(ws, user_id, segments: list):
+    resp = await send_action(ws, "send_private_msg", {
+        "user_id": int(user_id),
+        "message": segments
+    })
+    data = resp.get("data") or {}
+    return data.get("message_id") or data.get("id")
+
+async def send_private_forward_message(ws, user_id, messages, sender_id, sender_name="洛拉娜·奥蕾莉娅"):
+    nodes = []
+    for msg in messages:
+        nodes.append({
+            "type": "node",
+            "data": {"name": sender_name, "uin": str(sender_id), "content": msg}
+        })
+    # OneBot11: send_private_forward_msg
+    resp = await send_action(ws, "send_private_forward_msg", {
+        "user_id": int(user_id),
         "messages": nodes
     })
     data = resp.get("data") or {}
@@ -258,6 +290,32 @@ class Store:
 
 STORE = Store()
 
+# ==================== 触发状态持久化（JSON） ====================
+STATE_PATH = CONF / "trigger_state.json"
+TRIG_STATE: Dict[str, List[str]] = {
+    "dm_blocked": [],     # 私聊被关闭的 QQ 列表（字符串）
+    "group_enabled": []   # 非白名单中，被开启触发的群号列表（字符串）
+}
+
+def _state_load():
+    global TRIG_STATE
+    try:
+        if STATE_PATH.exists():
+            TRIG_STATE = json.loads(STATE_PATH.read_text(encoding="utf-8"))
+            # 容错：字段缺失则补齐
+            TRIG_STATE.setdefault("dm_blocked", [])
+            TRIG_STATE.setdefault("group_enabled", [])
+        else:
+            _state_save()
+    except Exception as e:
+        logging.warning(f"读取触发状态 JSON 异常：{e}")
+        _state_save()
+
+def _state_save():
+    tmp = STATE_PATH.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(TRIG_STATE, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.replace(STATE_PATH)
+
 # ==================== 迎新流程 ====================
 新人记录: Dict[str, List[str]] = {}
 定时器任务: Dict[str, asyncio.Task] = {}
@@ -328,6 +386,24 @@ async def schedule_welcome(ws, group_id):
     新人记录.pop(group_id, None)
     定时器任务.pop(group_id, None)
     logging.info(f"🧹 清理欢迎状态完成 | 群 {group_id}")
+
+# ==================== 触发许可判断 ====================
+def is_group_trigger_allowed(group_id: str) -> bool:
+    """是否允许该群触发（白名单直通；非白名单需全局允许且在已开启列表中）"""
+    group_id = str(group_id)
+    trigger_groups = set(str(x) for x in STORE.settings.get("trigger_groups", []))
+    if group_id in trigger_groups:
+        return True
+    if STORE.settings.get("trigger_allow_nonlisted_groups", False):
+        return group_id in set(TRIG_STATE.get("group_enabled", []))
+    return False
+
+def is_private_trigger_allowed(user_id: str) -> bool:
+    """是否允许这个私聊触发：需全局开且不在关闭名单"""
+    if not STORE.settings.get("trigger_enable_private", True):
+        return False
+    blocked = set(TRIG_STATE.get("dm_blocked", []))
+    return str(user_id) not in blocked
 
 # ==================== 触发逻辑 ====================
 def has_reply_segment(event: dict) -> bool:
@@ -474,38 +550,152 @@ async def handle_custom_triggers(ws, group_id, user_id, message, event=None):
         logging.info(f"✅ 组合触发 | 群 {group_id} | 用户 {user_id} | 关键字={best_kw_group!r} | 片段={files}")
 
         if texts:
-            fwd_id = await send_forward_message(
-                ws, group_id, texts,
-                STORE.self_id or STORE.settings.get("forward_sender_id", "2162317375")
-            )
-            logging.info(f"📨 合并转发已发送 | 群 {group_id} | fwd_id={fwd_id}")
+            is_private = bool(event) and (event.get("message_type") == "private")
+            if is_private:
+                fwd_id = await send_private_forward_message(
+                    ws, user_id, texts,
+                    STORE.self_id or STORE.settings.get("forward_sender_id", "2162317375")
+                )
+                delay_after_forward = float(STORE.settings.get("private_forward_then_hint_delay_seconds", 1.0))
+                try:
+                    await asyncio.sleep(delay_after_forward)
+                except Exception:
+                    pass
+                await send_private_msg(ws, user_id, "请阅读该聊天记录内的内容")
+                
+            else:
+                fwd_id = await send_forward_message(
+                    ws, group_id, texts,
+                    STORE.self_id or STORE.settings.get("forward_sender_id", "2162317375")
+                )
+                logging.info(f"📨 合并转发已发送 | 群 {group_id} | fwd_id={fwd_id}")
 
-            # 收集本条消息中 @到的其他用户（全量）
-            order_qqs = collect_other_ats(event or {}, STORE.self_id)
+                # 收集本条消息中 @到的其他用户（全量）
+                order_qqs = collect_other_ats(event or {}, STORE.self_id)
 
-            delay_after_forward = float(STORE.settings.get("group_forward_then_at_delay_seconds", 1.0))
-            try:
-                await asyncio.sleep(delay_after_forward)
-            except Exception:
-                pass
+                delay_after_forward = float(STORE.settings.get("group_forward_then_at_delay_seconds", 1.0))
+                try:
+                    await asyncio.sleep(delay_after_forward)
+                except Exception:
+                    pass
 
-            segs = []
-            if fwd_id:
-                segs.append({"type": "reply", "data": {"id": fwd_id}})
-            segs.append({"type": "text", "data": {"text": "请阅读该聊天记录内的内容"}})
-            for q in order_qqs:
-                segs.append({"type": "at", "data": {"qq": q}})
-
-            await send_group_msg_segments(ws, group_id, segs)
-            logging.info(f"📣 已 reply+@ | 群 {group_id} | at={order_qqs} | reply_to={fwd_id}")
+                segs = []
+                if fwd_id:
+                    segs.append({"type": "reply", "data": {"id": fwd_id}})
+                segs.append({"type": "text", "data": {"text": "请阅读该聊天记录内的内容"}})
+                for q in order_qqs:
+                    segs.append({"type": "at", "data": {"qq": q}})
+                await send_group_msg_segments(ws, group_id, segs)
+                logging.info(f"📣 已 reply+@ | 群 {group_id} | at={order_qqs} | reply_to={fwd_id}")
         return
 
     # —— 单条触发
     if best_single:
         logging.info(f"✅ 单条触发 | 群 {group_id} | 用户 {user_id} | 关键字={best_kw_single!r} | 文件={best_single[3].name}")
-        await send_group_msg(ws, group_id, best_single[2])
-        logging.info(f"📨 单条消息已发送 | 群 {group_id}")
+        is_private = bool(event) and (event.get("message_type") == "private")
+        if is_private:
+            await send_private_msg(ws, user_id, best_single[2])
+        else:
+            await send_group_msg(ws, group_id, best_single[2])
+        logging.info(f"📨 单条消息已发送 | 目标={'私聊' if is_private else group_id}")
         return
+
+# ==================== 开关命令：名字 + 回应(开|关) ====================
+def _build_switch_regex() -> Optional[re.Pattern]:
+    """
+    形如：
+      洛拉娜请回应开
+      洛拉娜回应 关
+    """
+    names = STORE.settings.get("names", []) or []
+    if not names:
+        return None
+    name_alt = "|".join(re.escape(n) for n in names if n)
+    # ^\s* 允许整条消息前有空白；\s*$ 允许末尾空白
+    # 名字 与 “回应” 之间不允许空格；“回应”和“开/关”之间允许空白
+    pat = rf"(?i)^\s*(?:{name_alt})回应\s*([开关])\s*$"
+    return re.compile(pat)
+
+async def maybe_handle_trigger_switch(ws, event: dict) -> bool:
+    """
+    处理开关命令。命中则返回 True（表示已处理，不再继续触发匹配）。
+    约束：
+      - 群内需群主/管理员/超管才能操作；
+      - 配置白名单群（trigger_groups）禁止被“回应关”；
+      - 非白名单群需全局允许非白名单（trigger_allow_nonlisted_groups=true）方可“回应开”；
+      - 私聊默认允许，通过“回应关/开”将该 QQ 加入/移出 dm_blocked。
+    """
+    if not isinstance(event, dict) or event.get("post_type") != "message":
+        return False
+
+    msg_type = event.get("message_type")
+    user_id = str(event.get("user_id"))
+    group_id = str(event.get("group_id")) if msg_type == "group" else None
+
+    # 拼 text_only（仅 text 段）
+    _, text_only = extract_at_info_and_text(event, STORE.self_id)
+    text = (text_only or event.get("raw_message") or "").strip()
+    if not text:
+        return False
+
+    rx = _build_switch_regex()
+    if not rx:
+        return False
+    m = rx.search(text)
+    if not m:
+        return False
+
+    action = m.group(2)  # '开' or '关'
+    super_id = str(STORE.settings.get("super_user_id", ""))
+
+    # ===== 私聊：直接改 dm_blocked =====
+    if msg_type == "private":
+        if action == "关":
+            if user_id not in TRIG_STATE["dm_blocked"]:
+                TRIG_STATE["dm_blocked"].append(user_id)
+                _state_save()
+            await send_private_msg(ws, user_id, "已为这条私聊关闭触发（回复“名字回应开”可重新开启）。")
+        else:  # 开
+            if user_id in TRIG_STATE["dm_blocked"]:
+                TRIG_STATE["dm_blocked"].remove(user_id)
+                _state_save()
+            await send_private_msg(ws, user_id, "已为这条私聊开启触发。")
+        return True
+
+    # ===== 群聊：需权限 & 规则判断 =====
+    if msg_type == "group" and group_id:
+        role = (event.get("sender") or {}).get("role", "")  # 'owner' / 'admin' / 'member'
+        is_admin = role in {"owner", "admin"} or (super_id and user_id == super_id)
+        if not is_admin:
+            await send_group_msg(ws, group_id, "只有群主/管理员或超管可以使用该命令。")
+            return True
+
+        trigger_groups = set(str(x) for x in STORE.settings.get("trigger_groups", []))
+
+        if action == "关":
+            # 白名单群禁止被关
+            if group_id in trigger_groups:
+                await send_group_msg(ws, group_id, "本群为配置白名单，禁止关闭触发。")
+                return True
+            # 非白名单：从“已开启列表”移除
+            if group_id in TRIG_STATE["group_enabled"]:
+                TRIG_STATE["group_enabled"].remove(group_id)
+                _state_save()
+            await send_group_msg(ws, group_id, "已关闭本群的触发。")
+            return True
+        else:  # 开
+            # 全局必须允许非白名单群可开
+            if (group_id not in trigger_groups) and (not STORE.settings.get("trigger_allow_nonlisted_groups", False)):
+                await send_group_msg(ws, group_id, "当前未启用“非白名单群可触发”，请先在配置中开启。")
+                return True
+            # 白名单群自然已开；非白名单则加入“已开启列表”
+            if (group_id not in trigger_groups) and (group_id not in TRIG_STATE["group_enabled"]):
+                TRIG_STATE["group_enabled"].append(group_id)
+                _state_save()
+            await send_group_msg(ws, group_id, "已开启本群的触发。")
+            return True
+
+    return False
 
 # ==================== 主循环 ====================
 async def reloader_loop():
@@ -519,6 +709,7 @@ async def reloader_loop():
 async def main():
     logging.basicConfig(level=logging.INFO, format='[%(asctime)s] %(message)s')
     STORE.load_all()
+    _state_load()
 
     uri = STORE.settings.get("ws_url", "ws://127.0.0.1:6700")
     welcome_enabled = STORE.settings.get("welcome_enabled", True)
@@ -588,10 +779,29 @@ async def main():
                                         logging.info(f"⏹️ 测试迎新：清理旧定时器 | 群 {group_id}")
                                     await schedule_welcome(ws, group_id)
                                 else:
-                                    if trigger_enabled and group_id in trigger_groups:
+                                    # 先处理开关命令（命中即返回）
+                                    if await maybe_handle_trigger_switch(ws, event):
+                                        continue
+
+                                    if trigger_enabled and is_group_trigger_allowed(group_id):
                                         await handle_custom_triggers(ws, group_id, user_id, raw, event)
                                     else:
-                                        logging.debug(f"⛔ 触发未启用或不在白名单群 | 群 {group_id}")
+                                        logging.debug(f"⛔ 触发未启用或该群未被允许 | 群 {group_id}")
+                            # 私聊消息
+                            elif event.get("post_type") == "message" and event.get("message_type") == "private":
+                                user_id = str(event["user_id"])
+                                raw = event.get("raw_message", "")
+                                logging.debug(f"✉️ 私聊 | 用户 {user_id} | 内容={raw!r}")
+
+                                # 先尝试处理开关命令（命中即返回）
+                                if await maybe_handle_trigger_switch(ws, event):
+                                    continue
+
+                                # 允许触发再匹配
+                                if trigger_enabled and is_private_trigger_allowed(user_id):
+                                    await handle_custom_triggers(ws, group_id=user_id, user_id=user_id, message=raw, event=event)
+                                else:
+                                    logging.debug(f"⛔ 私聊触发未启用或该私聊已关闭 | QQ {user_id}")
 
                         except Exception as e:
                             logging.warning(f"事件处理异常：{e}")
