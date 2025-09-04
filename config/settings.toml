@@ -19,7 +19,7 @@ trigger_allow_nonlisted_groups = true
 log_group = "583980948"
 
 # 迎新延迟与发送间隔（秒）
-welcome_delay_seconds = 120
+welcome_delay_seconds = 100
 welcome_gap_seconds = 2
 
 # 识别的称呼 & 触发冷却
